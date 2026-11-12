@@ -7,9 +7,10 @@ from unittest.mock import patch
 from django.conf import settings
 from django.core import mail
 from django.core.exceptions import ValidationError
-from django.test import TestCase
+from django.test import TestCase, override_settings
+from django.utils.html import format_html
 from django.utils.timezone import now
-from django_scopes import scopes_disabled
+from django_scopes import scope, scopes_disabled
 from zoneinfo import ZoneInfo
 
 from eventyay.base.models import (
@@ -20,11 +21,13 @@ from eventyay.base.models import (
     Order,
     Organizer,
     Quota,
+    SeatingPlan,
     Team,
     User,
     WaitingListEntry,
 )
 from eventyay.base.models.product import SubEventProduct as SubEventItem, SubEventProductVariation as SubEventItemVariation
+from eventyay.presale.signals import render_seating_plan
 from tests.tickets.base import SoupTest
 from tests.tickets.testdummy.signals import FoobarSalesChannel
 from eventyay.presale.views.contact import ContactOrganizerView
@@ -47,6 +50,52 @@ class EventTestMixin:
         t = Team.objects.create(organizer=self.orga, can_change_event_settings=True)
         t.members.add(self.user)
         t.limit_events.add(self.event)
+
+
+@override_settings(CORE_MODULES=(*settings.CORE_MODULES, __name__))
+class SeatingPlanFrameTest(EventTestMixin, TestCase):
+    @scopes_disabled()
+    def setUp(self):
+        super().setUp()
+        self.plan = SeatingPlan.objects.create(organizer=self.orga, name='Hall', layout='{}')
+        self.event_url = f'/{self.orga.slug}/{self.event.slug}'
+        self.event.tickets_published = True
+
+        def render_plan(sender, request, subevent=None, **kwargs):
+            return format_html(
+                '<span data-event="{}" data-subevent="{}">Seat A1</span>',
+                sender.pk,
+                subevent.pk if subevent else '',
+            )
+
+        render_seating_plan.connect(render_plan, weak=False)
+        self.addCleanup(render_seating_plan.disconnect, render_plan)
+
+    def test_event_seating_plan_frame(self):
+        self.event.seating_plan = self.plan
+        self.event.save()
+
+        response = self.client.get(f'{self.event_url}/seatingframe/')
+
+        self.assertContains(response, f'action="{self.event_url}/cart/add?')
+        self.assertContains(response, f'<span data-event="{self.event.pk}" data-subevent="">Seat A1</span>')
+
+    def test_subevent_seating_plan_frame(self):
+        self.event.has_subevents = True
+        self.event.save()
+        with scope(organizer=self.orga, event=self.event):
+            subevent = self.event.subevents.create(
+                name='First date',
+                date_from=self.event.date_from,
+                active=True,
+                seating_plan=self.plan,
+            )
+
+        response = self.client.get(f'{self.event_url}/{subevent.pk}/seatingframe/')
+
+        self.assertContains(response, f'action="{self.event_url}/cart/add?')
+        self.assertContains(response, f'name="subevent" value="{subevent.pk}"')
+        self.assertContains(response, f'<span data-event="{self.event.pk}" data-subevent="{subevent.pk}">Seat A1</span>')
 
 
 class EventMiddlewareTest(EventTestMixin, SoupTest):
